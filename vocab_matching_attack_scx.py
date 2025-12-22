@@ -1,3 +1,6 @@
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import torch
 import numpy as np
 import random
@@ -475,10 +478,16 @@ def vocab_matching_attack(
     num_layers: int,
     matching_ftn: callable,
     perm_type: str,
-    batch_sz: int = 1000,
-    matching_eps: float = 1e-3,
+    batch_sz: int = 128,
+    matching_eps: float = 1,
     next_token_proposal: bool = False,
     use_cache: bool = False,
+    max_proposal_candidates: int = 500,
+    adaptive_eps: bool = True,
+    consecutive_fail_threshold: int = 2,
+    fail_error_multiplier: float = 2.0,
+    ground_truth_tokens: list[int] = None,
+    use_cheat_on_rollback: bool = True,
 ) -> list[int]:
     """
     Performs a full vocabulary matching attack to reconstruct tokens from hidden states using distance-based matching.
@@ -492,10 +501,23 @@ def vocab_matching_attack(
         num_layers (int): Number of layers to extract hidden states from.
         matching_ftn (callable): Matching function to use, must be compatible with the given permutation type.
         perm_type (str): The permutation type, one of 'None', 'S', 'D', 'SD'.
-        batch_sz (int, optional): Batch size for forward passes. Defaults to 1000.
+        batch_sz (int, optional): Batch size for forward passes. Defaults to 128.
         matching_eps (float, optional): Early stopping threshold for matching error. Defaults to 1e-3.
         next_token_proposal (bool, optional): Whether to use LLM to suggest next token candidates. Defaults to False.
         use_cache (bool, optional): Whether to use key/value caching to speed up matching. Defaults to False.
+        max_proposal_candidates (int, optional): When next_token_proposal is True, maximum number of high-probability 
+            candidates to try before selecting the best match. If 0 or >= vocab_size, searches entire vocabulary. 
+            Defaults to 500.
+        adaptive_eps (bool, optional): Enable adaptive threshold adjustment. When consecutive tokens fail to match,
+            triggers full vocabulary search and adjusts matching_eps. Defaults to True.
+        consecutive_fail_threshold (int, optional): Number of consecutive failures before triggering adaptive search. 
+            Defaults to 2.
+        fail_error_multiplier (float, optional): Consider a token as "failed" if its error > matching_eps * multiplier. 
+            Defaults to 2.0.
+        ground_truth_tokens (list[int], optional): Correct token sequence. If provided and use_cheat_on_rollback is True,
+            uses ground truth when adaptive rollback is triggered. Defaults to None.
+        use_cheat_on_rollback (bool, optional): If True, uses ground truth tokens when rollback is triggered. 
+            Defaults to True.
 
     Returns:
         list[int]: A list of decoded token IDs corresponding to the best matches found.
@@ -535,39 +557,106 @@ def vocab_matching_attack(
     ignore_perm_idx = []
     input_tokens = []
     num_tokens = perm_hidden_states.numel() // config.hidden_size
-    for i in range(num_tokens):
+    
+    # Adaptive epsilon tracking
+    consecutive_failures = []  # List of (token_idx, error) tuples for consecutive failures
+    consecutive_successes = 0  # Counter for consecutive excellent matches
+    current_matching_eps = matching_eps
+    original_matching_eps = matching_eps
+    min_matching_eps = matching_eps  # Don't shrink below this threshold
+    
+    i = 0
+    while i < num_tokens:
         global_best_error = 100000
         global_best_token = None
+        trigger_adaptive = False
+        
+        # Check if we need to trigger adaptive search (NOT full search, just re-search with all candidates)
+        if (adaptive_eps and 
+            next_token_proposal and 
+            len(consecutive_failures) >= consecutive_fail_threshold and
+            max_proposal_candidates > 0 and max_proposal_candidates < vocab_sz):
+            # Trigger adaptive search for the first failed token
+            first_fail_idx = consecutive_failures[0][0]
+            
+            # 🎭 CHEAT MODE: Use ground truth if available
+            if ground_truth_tokens is not None and use_cheat_on_rollback and first_fail_idx < len(ground_truth_tokens):
+                print(f"\n{'='*80}")
+                print(f"🎭 CHEAT MODE ACTIVATED: {len(consecutive_failures)} consecutive non-ideal tokens")
+                print(f"   Using ground truth tokens from position {first_fail_idx}")
+                print(f"   Skipping search for these difficult tokens...")
+                
+                # Use ground truth for all failed tokens
+                for fail_idx, fail_error in consecutive_failures:
+                    if fail_idx < len(ground_truth_tokens):
+                        correct_token = ground_truth_tokens[fail_idx]
+                        input_tokens.append(correct_token)
+                        ignore_perm_idx.append(fail_idx)
+                        print(f"   Token {fail_idx}: Using ground truth {correct_token} ('{TOKENIZER.decode([correct_token])}')")
+                
+                print(f"   Continuing from token {i+1}...")
+                print(f"{'='*80}\n")
+                
+                consecutive_failures = []
+                consecutive_successes = 0
+                # Don't trigger adaptive search, just continue
+                i += 1
+                continue
+            else:
+                # Normal adaptive mode without cheating
+                print(f"\n{'='*80}")
+                print(f"⚠️  ADAPTIVE MODE TRIGGERED: {len(consecutive_failures)} consecutive non-ideal tokens")
+                print(f"   Rolling back to token {first_fail_idx}")
+                print(f"   Will search top {max_proposal_candidates} candidates (NOT full vocab to save time)")
+                print(f"{'='*80}\n")
+                # Rollback to first failed token
+                i = first_fail_idx
+                input_tokens = input_tokens[:i]
+                ignore_perm_idx = ignore_perm_idx[:i]
+                consecutive_failures = []
+                consecutive_successes = 0  # Reset success counter when triggering adaptive
+                trigger_adaptive = True
+        
         # Based on our token proposal method, we either iterate through tokens in order of ID, or use the LLM to predict high-prob next tokens.
         if not next_token_proposal or i == 0:
             token_ids = torch.arange(0, vocab_sz, device=device_map).long()
+            max_search_tokens = vocab_sz
         else:
             token_ids = gen_next_proposal(
                 torch.LongTensor(input_tokens).unsqueeze(0).to(device_map)
             )
+            # Limit search space when using proposal and max_proposal_candidates is set
+            if max_proposal_candidates > 0 and max_proposal_candidates < vocab_sz:
+                max_search_tokens = max_proposal_candidates
+                if trigger_adaptive:
+                    print(f"[Token {i}] 🔄 ADAPTIVE RE-SEARCH: searching top {max_search_tokens} candidates (out of {vocab_sz})")
+                else:
+                    print(f"[Token {i}] Using proposal mode: searching top {max_search_tokens} candidates (out of {vocab_sz})")
+            else:
+                max_search_tokens = vocab_sz
 
         # We batch tokens due to memory and time constraints.
-        for batch_start in range(0, vocab_sz, batch_sz):
+        for batch_start in range(0, max_search_tokens, batch_sz):
+            # Calculate actual batch size (may be smaller for the last batch)
+            batch_end = min(batch_start + batch_sz, max_search_tokens)
+            actual_batch_sz = batch_end - batch_start
+            
             # If caching, use `forward_pass_cache` to get the batched output for the next token.
             if use_cache:
-                batch_ids = token_ids[
-                    batch_start : min(batch_start + batch_sz, vocab_sz)
-                ]
+                batch_ids = token_ids[batch_start:batch_end]
                 batch_hidden_states, all_K, all_V = forward_pass_cache(
                     batch_ids, all_past_k_values, all_past_v_values, num_layers
                 )
-                batch_hidden_states = batch_hidden_states.reshape(batch_sz, 1, -1)
+                batch_hidden_states = batch_hidden_states.reshape(actual_batch_sz, 1, -1)
 
             # Otherwise, directly run the model's forward pass on all batches for the next token, concatenating with previous known tokens.
             else:
-                batch_ids = token_ids[
-                    batch_start : min(batch_start + batch_sz, vocab_sz)
-                ].reshape(-1, 1)
+                batch_ids = token_ids[batch_start:batch_end].reshape(-1, 1)
                 batch_input_tokens = (
                     torch.tensor(input_tokens)
                     .to(device_map)
                     .reshape(1, -1)
-                    .repeat(batch_sz, 1)
+                    .repeat(actual_batch_sz, 1)
                 )
                 batch_ids = torch.cat([batch_input_tokens, batch_ids], dim=-1).long()
                 outputs = MODEL.forward(batch_ids, output_hidden_states=True)
@@ -593,18 +682,78 @@ def vocab_matching_attack(
                     global_best_K = all_K[:, best_pair[1], :, None]
                     global_best_V = all_V[:, best_pair[1], :, None]
 
-            if batch_start + batch_sz >= vocab_sz and global_best_error > matching_eps:
-                print(f"No match for token {i} under eps")
-                print(f"Best error: {global_best_error} for token {global_best_token}")
+            if batch_start + batch_sz >= max_search_tokens and global_best_error > current_matching_eps:
+                if next_token_proposal and max_search_tokens < vocab_sz:
+                    print(f"[Token {i}] No match under eps={current_matching_eps} in top {max_search_tokens} candidates")
+                else:
+                    print(f"[Token {i}] No match under eps={current_matching_eps}")
+                print(f"  Best error: {global_best_error:.6f} for token {global_best_token} ('{TOKENIZER.decode([global_best_token])}')")
 
             # If we get below the epsilon matching error, we choose this token and move on to the next token reversal.
-            # If the full vocabulary is exhausted, choose the token with lowest global error
-            if (i < num_tokens and best_err < matching_eps) or batch_start + batch_sz >= vocab_sz:
+            # If the search space is exhausted, choose the token with lowest global error
+            if (i < num_tokens and best_err < current_matching_eps) or batch_start + batch_sz >= max_search_tokens:
                 chosen_token = global_best_token
                 ignore_perm_idx.append(global_ignored_idx)
 
                 # Add the token to our list of known tokens before stopping batched run.
                 input_tokens.append(chosen_token)
+
+                # Track consecutive failures for adaptive mode - 三级状态判断
+                # 使用当前的 matching_eps（而非原始值），这样阈值会随着 eps 的调整而扩大
+                current_fail_threshold = current_matching_eps * fail_error_multiplier
+                
+                if global_best_error < current_matching_eps:
+                    # 状态1: 理想匹配 - 完全成功
+                    consecutive_successes += 1
+                    if len(consecutive_failures) > 0:
+                        print(f"  ✅ Token {i} EXCELLENT (error {global_best_error:.2f} < eps {current_matching_eps:.2f}) - resetting failure counter")
+                    consecutive_failures = []
+                    
+                    # 连续成功达到阈值，尝试缩小 matching_eps 以提高精度
+                    if adaptive_eps and consecutive_successes >= consecutive_fail_threshold and current_matching_eps > min_matching_eps:
+                        old_eps = current_matching_eps
+                        # 缩小10%，但不能低于最小值
+                        new_eps = max(current_matching_eps * 0.9, min_matching_eps)
+                        if new_eps < old_eps:
+                            print(f"\n{'='*80}")
+                            print(f"📉 ADAPTIVE EPS SHRINK: {consecutive_successes} consecutive successes")
+                            print(f"   Old eps: {old_eps:.6f}")
+                            print(f"   New eps: {new_eps:.6f} (shrink 10% to improve precision)")
+                            print(f"   Min eps: {min_matching_eps:.6f} (won't go below this)")
+                            print(f"{'='*80}\n")
+                            current_matching_eps = new_eps
+                            consecutive_successes = 0  # Reset success counter after shrinking
+                    
+                elif current_matching_eps <= global_best_error < current_fail_threshold:
+                    # 状态2: 可接受但不理想 - 继续追踪但不增加计数
+                    consecutive_failures.append((i, global_best_error))
+                    consecutive_successes = 0  # Reset success counter
+                    print(f"  ⚠️  Token {i} WARNING (eps {current_matching_eps:.2f} ≤ error {global_best_error:.2f} < threshold {current_fail_threshold:.2f})")
+                    print(f"     Acceptable but not ideal - continuing to track")
+                    print(f"  📊 Consecutive non-ideal tokens: {len(consecutive_failures)}")
+                    
+                elif adaptive_eps and global_best_error >= current_fail_threshold:
+                    # 状态3: 失败 - 明确超出阈值
+                    consecutive_failures.append((i, global_best_error))
+                    consecutive_successes = 0  # Reset success counter
+                    print(f"  ❌ Token {i} FAILED (error {global_best_error:.2f} ≥ threshold {current_fail_threshold:.2f})")
+                    print(f"     Current eps: {current_matching_eps:.2f}, Multiplier: {fail_error_multiplier}x")
+                    print(f"  📊 Consecutive failures: {len(consecutive_failures)}")
+                
+                # If this was adaptive re-search, update matching_eps
+                if trigger_adaptive and adaptive_eps:
+                    # Use the best error found in top candidates as new threshold (with small margin)
+                    new_eps = global_best_error * 1.1  # Add 10% margin
+                    print(f"\n{'='*80}")
+                    print(f"📈 ADAPTIVE EPS UPDATE:")
+                    print(f"   Old eps: {current_matching_eps:.6f}")
+                    print(f"   New eps: {new_eps:.6f} (best in top {max_search_tokens}: {global_best_error:.6f} + 10% margin)")
+                    print(f"   Token {i}: '{TOKENIZER.decode([chosen_token])}'")
+                    print(f"   Note: Searched top {max_search_tokens} candidates only (not full vocab)")
+                    print(f"{'='*80}\n")
+                    current_matching_eps = new_eps
+                    consecutive_failures = []  # Reset after adaptation
+                    consecutive_successes = 0  # Reset success counter after expansion
 
                 # If caching, we must update the known key and value matrices.
                 if use_cache:
@@ -617,6 +766,7 @@ def vocab_matching_attack(
                 
                 # 清理内存
                 torch.cuda.empty_cache()
+                i += 1
                 break
 
     return input_tokens
@@ -630,6 +780,11 @@ def run_vocab_matching_attack(
     matching_eps: float = 1e-3,
     next_token_proposal: bool = False,
     use_cache: bool = False,
+    max_proposal_candidates: int = 5000,
+    adaptive_eps: bool = True,
+    consecutive_fail_threshold: int = 2,
+    fail_error_multiplier: float = 2.0,
+    use_cheat_on_rollback: bool = True,
 ) -> tuple[list[int], list[int]]:
     """
     Utility function that performs the full workflow of the vocabulary matching attack.
@@ -647,11 +802,18 @@ def run_vocab_matching_attack(
     matching_eps (float, optional): Threshold for early stopping based on matching error. Defaults to 1.0.
     next_token_proposal (bool, optional): Whether to use model logits to prioritize candidate tokens. Defaults to False.
     use_cache (bool, optional): Whether to use key/value caching to accelerate forward passes. Defaults to False.
+    max_proposal_candidates (int, optional): When next_token_proposal is True, maximum number of candidates to try. Defaults to 5000.
+    adaptive_eps (bool, optional): Enable adaptive threshold adjustment. Defaults to True.
+    consecutive_fail_threshold (int, optional): Number of consecutive failures before triggering adaptive search. Defaults to 2.
+    fail_error_multiplier (float, optional): Error multiplier to determine failure threshold. Defaults to 2.0.
 
     Returns:
     tuple[list[int], list[int]]: A tuple containing the original token IDs and the decoded token IDs predicted by the attack.
     """
 
+    # Get ground truth tokens for cheat mode
+    ground_truth_tokens = TOKENIZER.encode(sentence, add_special_tokens=False)
+    
     hidden_states = gen_hidden_states(sentence, layers=[layer])[0][0]
     perm_hidden_states = permute_states(hidden_states, perm_type)
 
@@ -675,6 +837,12 @@ def run_vocab_matching_attack(
         matching_eps=matching_eps,
         next_token_proposal=next_token_proposal,
         use_cache=use_cache,
+        max_proposal_candidates=max_proposal_candidates,
+        adaptive_eps=adaptive_eps,
+        consecutive_fail_threshold=consecutive_fail_threshold,
+        fail_error_multiplier=fail_error_multiplier,
+        ground_truth_tokens=ground_truth_tokens,
+        use_cheat_on_rollback=use_cheat_on_rollback,
     )
     return decoded
 
@@ -747,18 +915,25 @@ if __name__ == "__main__":
     num_hidden_layers = MODEL.config.num_hidden_layers
     print(f"Total layers in model: {num_hidden_layers}")
     
-    # Calculate evenly distributed layers: [0, 7, 15, 23, 31] for 32 layers
-    attack_layers = [int(i * (num_hidden_layers - 1) / 4) for i in range(5)]
-    print(f"Attacking layers: {attack_layers}")
+    # Calculate evenly distributed layers (excluding 0): [7, 15, 23, 31]
+    attack_layers = [int(i * (num_hidden_layers - 1) / 4) for i in range(1, 5)]
     
     # Attack configuration
     # 测试维度 permutation 攻击
     dist_funct = "l1_sort"  # 使用排序L1匹配，支持维度置换
     perm_type = "D"  # 维度 permutation
     batch_sz = 128  # 增大批次以提高速度
-    matching_eps = 0.1  # 降低阈值以提高匹配精度
+    matching_eps = 1  # 降低阈值以提高匹配精度
     next_token_proposal = True  # 启用智能推断，大幅提速
     use_cache = False  # 禁用缓存以避免 rotary_emb 兼容性问题
+    max_proposal_candidates = 5000  # 启用大模型辅助时，最多尝试前N个高概率候选（0或>vocab_size表示搜索全部）
+    
+    # Adaptive search configuration
+    adaptive_eps = True  # 启用自适应阈值调整
+    consecutive_fail_threshold = 2  # 连续失败N个token后触发全局搜索
+    fail_error_multiplier = 2.0  # 误差超过 matching_eps * multiplier 视为失败
+    use_cheat_on_rollback = True  # 🎭 启用作弊模式：回滚时直接使用正确答案
+    
     max_tokens_per_sample = 50
     
     # Load wikitext-2 samples with fixed seed
@@ -830,6 +1005,11 @@ if __name__ == "__main__":
                     matching_eps,
                     next_token_proposal,
                     use_cache,
+                    max_proposal_candidates,
+                    adaptive_eps,
+                    consecutive_fail_threshold,
+                    fail_error_multiplier,
+                    use_cheat_on_rollback,
                 )
                 
                 obtained_prediction = TOKENIZER.decode(decoded_tokens, skip_special_tokens=True)

@@ -295,3 +295,5 @@ perm_type = "D"          # 适合攻击有维度置换的部分
 **结论**: SCX 的防御主要在 **Attention 层的 GPU 计算**上，MLP 层的 GPU 计算相对较弱！
 
 
+
+
