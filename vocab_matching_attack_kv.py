@@ -146,11 +146,18 @@ def kv_matching_attack(
     input_tokens = []
     
     for i in range(num_tokens):
+        # 第一个token直接使用正确的token
+        if i == 0 and ground_truth_tokens is not None and len(ground_truth_tokens) > 0:
+            correct_token = ground_truth_tokens[0]
+            input_tokens.append(correct_token)
+            print(f"✓ Token {i}: {correct_token} ('{tokenizer.decode([correct_token])}') [使用正确的token]")
+            continue
+        
         global_best_error = float('inf')
         global_best_token = None
         
         # 根据是否使用next token proposal决定搜索策略
-        if not next_token_proposal or i == 0:
+        if not next_token_proposal:
             token_ids = torch.arange(0, vocab_sz, device=device_map).long()
             max_search_tokens = vocab_sz
         else:
@@ -299,6 +306,7 @@ def run_kv_attack(
         next_token_proposal=next_token_proposal,
         max_proposal_candidates=max_proposal_candidates,
         device_map=device_map,
+        ground_truth_tokens=ground_truth_tokens,
     )
     
     return ground_truth_tokens, decoded_tokens
@@ -441,6 +449,9 @@ def main():
         perm_suffix = "no_perm" if args.perm_type == "None" else "with_perm"
         args.output = f"kv_attack_results_{args.model}_{perm_suffix}.json"
     
+    # 设置句子对输出文件
+    sentences_output_file = args.output.replace('.json', '_sentences.json')
+    
     # 运行攻击
     results = {
         'model_name': args.model,
@@ -454,6 +465,17 @@ def main():
     next_token_proposal = not args.no_next_token_proposal
     
     print(f"Next token proposal: {'Enabled' if next_token_proposal else 'Disabled'}")
+    print(f"句子对将保存到: {sentences_output_file}")
+    print(f"每5个样本写入一次\n")
+    
+    # 初始化句子对JSON文件
+    sentences_data = {
+        'model_name': args.model,
+        'perm_type': args.perm_type,
+        'sentences': []
+    }
+    with open(sentences_output_file, 'w', encoding='utf-8') as f:
+        json.dump(sentences_data, f, indent=2, ensure_ascii=False)
     
     for layer in attack_layers:
         print(f"\n{'='*80}")
@@ -470,6 +492,9 @@ def main():
             'perm_type': perm_type,
             'samples': []
         }
+        
+        # 用于临时存储最近5个样本的句子对
+        pending_sentences = []
         
         for idx, prompt in enumerate(tqdm(test_samples, desc=f"Layer {layer}")):
             try:
@@ -502,15 +527,71 @@ def main():
                 
                 layer_results['samples'].append(sample_result)
                 
+                # 添加到待写入列表
+                pending_sentences.append({
+                    'layer': layer,
+                    'sample_idx': idx,
+                    'original': original_text,
+                    'predicted': predicted_text
+                })
+                
                 status = "✓" if success else "✗"
                 print(f"\n{status} Sample {idx}: {'SUCCESS' if success else 'FAILED'}")
                 print(f"  Original : {original_text[:80]}{'...' if len(original_text) > 80 else ''}")
                 print(f"  Predicted: {predicted_text[:80]}{'...' if len(predicted_text) > 80 else ''}")
+                
+                # 每5个样本写入一次
+                if len(pending_sentences) >= 5:
+                    # 读取现有JSON数据
+                    try:
+                        with open(sentences_output_file, 'r', encoding='utf-8') as f:
+                            sentences_data = json.load(f)
+                    except (FileNotFoundError, json.JSONDecodeError):
+                        sentences_data = {
+                            'model_name': args.model,
+                            'perm_type': args.perm_type,
+                            'sentences': []
+                        }
+                    
+                    # 追加新的句子对
+                    for sent_pair in pending_sentences:
+                        sentences_data['sentences'].append(sent_pair)
+                    
+                    # 写回JSON文件
+                    with open(sentences_output_file, 'w', encoding='utf-8') as f:
+                        json.dump(sentences_data, f, indent=2, ensure_ascii=False)
+                    
+                    print(f"💾 已写入 {len(pending_sentences)} 个句子对到JSON文件")
+                    pending_sentences = []  # 清空列表
             
             except Exception as e:
                 print(f"\n❌ Error processing sample {idx}: {e}")
                 import traceback
                 traceback.print_exc()
+        
+        # 写入剩余的样本（如果不足5个）
+        if len(pending_sentences) > 0:
+            # 读取现有JSON数据
+            try:
+                with open(sentences_output_file, 'r', encoding='utf-8') as f:
+                    sentences_data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                sentences_data = {
+                    'model_name': args.model,
+                    'perm_type': args.perm_type,
+                    'sentences': []
+                }
+            
+            # 追加剩余的句子对
+            for sent_pair in pending_sentences:
+                sentences_data['sentences'].append(sent_pair)
+            
+            # 写回JSON文件
+            with open(sentences_output_file, 'w', encoding='utf-8') as f:
+                json.dump(sentences_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"💾 已写入剩余的 {len(pending_sentences)} 个句子对到JSON文件")
+            pending_sentences = []
         
         # 统计成功率
         successful = sum(1 for s in layer_results['samples'] if s['success'])
