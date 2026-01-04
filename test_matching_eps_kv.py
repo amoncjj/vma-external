@@ -58,8 +58,32 @@ def gen_kv_states(model, tokenizer, sentence, layers=[1], device_map="cuda"):
     
     return k_states_list, v_states_list
 
+def generate_permutation(N: int, d: int, perm_type: str, device: torch.device) -> tuple:
+    """生成置换索引，用于K和V共享同一置换"""
+    seq_perm = None
+    dim_perm = None
+    
+    if perm_type == "S":
+        seq_perm = torch.randperm(N, device=device)
+    elif perm_type == "D":
+        dim_perm = torch.randperm(d, device=device)
+    elif perm_type == "SD":
+        seq_perm = torch.randperm(N, device=device)
+        dim_perm = torch.randperm(d, device=device)
+    
+    return seq_perm, dim_perm
+
+def apply_permutation(states: torch.Tensor, seq_perm: torch.Tensor, dim_perm: torch.Tensor) -> torch.Tensor:
+    """应用预生成的置换"""
+    result = states
+    if dim_perm is not None:
+        result = result[:, dim_perm]
+    if seq_perm is not None:
+        result = result[seq_perm]
+    return result
+
 def permute_states(states: torch.Tensor, perm_type: str) -> torch.Tensor:
-    """对states进行置换"""
+    """对states进行置换（单独使用时，不与其他tensor共享置换）"""
     N, d = states.size()
     device = states.device
     if perm_type == "None":
@@ -104,12 +128,19 @@ def compute_kv_errors(
     k_states = k_states_list[0]
     v_states = v_states_list[0]
     
-    # 应用置换
-    perm_k_states = permute_states(k_states, perm_type)
-    perm_v_states = permute_states(v_states, perm_type)
+    # 生成共享的置换（K和V使用相同的置换）
+    N, d = k_states.size()
+    seq_perm, dim_perm = generate_permutation(N, d, perm_type, k_states.device)
+    
+    # 应用相同的置换到K和V
+    perm_k_states = apply_permutation(k_states, seq_perm, dim_perm)
+    perm_v_states = apply_permutation(v_states, seq_perm, dim_perm)
     
     # 记录每个token的error
     error_logs = []
+    
+    # 根据 perm_type 决定是否使用排序
+    use_sort = (perm_type == "D" or perm_type == "SD")
     
     # 逐步构建token序列，每次添加一个正确的token
     for i in range(num_tokens):
@@ -137,12 +168,19 @@ def compute_kv_errors(
         perm_k_row = perm_k_states[i, :]
         perm_v_row = perm_v_states[i, :]
         
-        sorted_perm_k, _ = torch.sort(perm_k_row)
-        sorted_k, _ = torch.sort(k_last)
-        k_error = torch.sum(torch.abs(sorted_perm_k - sorted_k)).item()
+        # 根据 perm_type 决定是否排序
+        if use_sort:
+            sorted_perm_k, _ = torch.sort(perm_k_row)
+            sorted_k, _ = torch.sort(k_last)
+            sorted_perm_v, _ = torch.sort(perm_v_row)
+            sorted_v, _ = torch.sort(v_last)
+        else:
+            sorted_perm_k = perm_k_row
+            sorted_k = k_last
+            sorted_perm_v = perm_v_row
+            sorted_v = v_last
         
-        sorted_perm_v, _ = torch.sort(perm_v_row)
-        sorted_v, _ = torch.sort(v_last)
+        k_error = torch.sum(torch.abs(sorted_perm_k - sorted_k)).item()
         v_error = torch.sum(torch.abs(sorted_perm_v - sorted_v)).item()
         
         total_error = k_error + v_error

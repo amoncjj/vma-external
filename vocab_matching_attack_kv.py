@@ -65,8 +65,32 @@ def gen_next_proposal(model, token_ids):
     logits = output.logits[0, -1]
     return torch.argsort(logits, descending=True).long()
 
+def generate_permutation(N: int, d: int, perm_type: str, device: torch.device) -> tuple:
+    """生成置换索引，用于K和V共享同一置换"""
+    seq_perm = None
+    dim_perm = None
+    
+    if perm_type == "S":
+        seq_perm = torch.randperm(N, device=device)
+    elif perm_type == "D":
+        dim_perm = torch.randperm(d, device=device)
+    elif perm_type == "SD":
+        seq_perm = torch.randperm(N, device=device)
+        dim_perm = torch.randperm(d, device=device)
+    
+    return seq_perm, dim_perm
+
+def apply_permutation(states: torch.Tensor, seq_perm: torch.Tensor, dim_perm: torch.Tensor) -> torch.Tensor:
+    """应用预生成的置换"""
+    result = states
+    if dim_perm is not None:
+        result = result[:, dim_perm]
+    if seq_perm is not None:
+        result = result[seq_perm]
+    return result
+
 def permute_states(states: torch.Tensor, perm_type: str) -> torch.Tensor:
-    """对states进行置换"""
+    """对states进行置换（单独使用时，不与其他tensor共享置换）"""
     N, d = states.size()
     device = states.device
     if perm_type == "None":
@@ -86,6 +110,7 @@ def kv_matching_attack(
     perm_k_states: torch.Tensor,
     perm_v_states: torch.Tensor,
     layer: int,
+    perm_type: str = "None",
     batch_sz: int = 128,
     matching_eps: float = 1.0,
     next_token_proposal: bool = True,
@@ -102,6 +127,7 @@ def kv_matching_attack(
         perm_k_states: Permuted K states (num_tokens, k_dim)
         perm_v_states: Permuted V states (num_tokens, v_dim)
         layer: 要攻击的层
+        perm_type: 置换类型 ("None" 或 "D")
         batch_sz: 批次大小
         matching_eps: 匹配阈值
         next_token_proposal: 是否使用next token proposal
@@ -111,6 +137,9 @@ def kv_matching_attack(
     Returns:
         解码出的token列表
     """
+    # 根据 perm_type 决定是否使用排序
+    use_sort = (perm_type == "D" or perm_type == "SD")
+    
     vocab_sz = model.config.vocab_size
     num_tokens = perm_k_states.shape[0]
     
@@ -161,20 +190,29 @@ def kv_matching_attack(
             batch_k = k_cache[:, :, -1, :].reshape(batch_size, num_heads * head_dim)
             batch_v = v_cache[:, :, -1, :].reshape(batch_size, num_heads * head_dim)
             
-            # 计算K和V的L1距离（使用排序）
+            # 获取目标 K 和 V
             perm_k_row = perm_k_states[i, :]
             perm_v_row = perm_v_states[i, :]
             
-            sorted_perm_k, _ = torch.sort(perm_k_row)
-            sorted_perm_v, _ = torch.sort(perm_v_row)
+            # 根据 perm_type 决定是否排序
+            if use_sort:
+                sorted_perm_k, _ = torch.sort(perm_k_row)
+                sorted_perm_v, _ = torch.sort(perm_v_row)
+            else:
+                sorted_perm_k = perm_k_row
+                sorted_perm_v = perm_v_row
             
             # 计算每个候选的K和V error
             batch_best_error = float('inf')
             batch_best_token = None
             
             for j in range(actual_batch_sz):
-                sorted_k, _ = torch.sort(batch_k[j])
-                sorted_v, _ = torch.sort(batch_v[j])
+                if use_sort:
+                    sorted_k, _ = torch.sort(batch_k[j])
+                    sorted_v, _ = torch.sort(batch_v[j])
+                else:
+                    sorted_k = batch_k[j]
+                    sorted_v = batch_v[j]
                 
                 k_error = torch.sum(torch.abs(sorted_perm_k - sorted_k)).item()
                 v_error = torch.sum(torch.abs(sorted_perm_v - sorted_v)).item()
@@ -240,9 +278,13 @@ def run_kv_attack(
     k_states = k_states_list[0]
     v_states = v_states_list[0]
     
-    # 应用置换
-    perm_k_states = permute_states(k_states, perm_type)
-    perm_v_states = permute_states(v_states, perm_type)
+    # 生成共享的置换（K和V使用相同的置换）
+    N, d = k_states.size()
+    seq_perm, dim_perm = generate_permutation(N, d, perm_type, k_states.device)
+    
+    # 应用相同的置换到K和V
+    perm_k_states = apply_permutation(k_states, seq_perm, dim_perm)
+    perm_v_states = apply_permutation(v_states, seq_perm, dim_perm)
     
     # 执行攻击
     decoded_tokens = kv_matching_attack(
@@ -251,6 +293,7 @@ def run_kv_attack(
         perm_k_states,
         perm_v_states,
         layer,
+        perm_type=perm_type,
         batch_sz=batch_sz,
         matching_eps=matching_eps,
         next_token_proposal=next_token_proposal,
@@ -331,6 +374,8 @@ def main():
                         help="批次大小")
     parser.add_argument("--max_proposal_candidates", type=int, default=5000,
                         help="最大候选数")
+    parser.add_argument("--no_next_token_proposal", action="store_true",
+                        help="禁用next token proposal（不使用大模型辅助）")
     parser.add_argument("--output", type=str, default=None,
                         help="输出结果文件")
     
@@ -402,10 +447,13 @@ def main():
         'perm_type': args.perm_type,
         'num_samples': len(test_samples),
         'attack_layers': attack_layers,
+        'next_token_proposal': not args.no_next_token_proposal,
         'layers': []
     }
     perm_type = args.perm_type
-    next_token_proposal = True
+    next_token_proposal = not args.no_next_token_proposal
+    
+    print(f"Next token proposal: {'Enabled' if next_token_proposal else 'Disabled'}")
     
     for layer in attack_layers:
         print(f"\n{'='*80}")
