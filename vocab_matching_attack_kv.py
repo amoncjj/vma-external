@@ -444,14 +444,6 @@ def main():
     
     print(f"\nLoaded {len(test_samples)} samples\n")
     
-    # 设置输出文件
-    if args.output is None:
-        perm_suffix = "no_perm" if args.perm_type == "None" else "with_perm"
-        args.output = f"kv_attack_results_{args.model}_{perm_suffix}.json"
-    
-    # 设置句子对输出文件
-    sentences_output_file = args.output.replace('.json', '_sentences.json')
-    
     # 运行攻击
     results = {
         'model_name': args.model,
@@ -465,19 +457,33 @@ def main():
     next_token_proposal = not args.no_next_token_proposal
     
     print(f"Next token proposal: {'Enabled' if next_token_proposal else 'Disabled'}")
-    print(f"句子对将保存到: {sentences_output_file}")
     print(f"每5个样本写入一次\n")
     
-    # 初始化句子对JSON文件
-    sentences_data = {
-        'model_name': args.model,
-        'perm_type': args.perm_type,
-        'sentences': []
-    }
-    with open(sentences_output_file, 'w', encoding='utf-8') as f:
-        json.dump(sentences_data, f, indent=2, ensure_ascii=False)
-    
     for layer in attack_layers:
+        # 为每个层设置单独的输出文件
+        if args.output is None:
+            perm_suffix = "no_perm" if args.perm_type == "None" else "with_perm"
+            layer_output_file = f"kv_attack_results_{args.model}_{perm_suffix}_layer{layer}.json"
+        else:
+            # 如果指定了输出文件，在文件名中插入层信息
+            base_name = args.output.replace('.json', '')
+            layer_output_file = f"{base_name}_layer{layer}.json"
+        
+        # 设置句子对输出文件
+        sentences_output_file = layer_output_file.replace('.json', '_sentences.json')
+        
+        # 初始化句子对JSON文件
+        sentences_data = {
+            'model_name': args.model,
+            'perm_type': args.perm_type,
+            'layer': layer,
+            'sentences': []
+        }
+        with open(sentences_output_file, 'w', encoding='utf-8') as f:
+            json.dump(sentences_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"结果将保存到: {layer_output_file}")
+        print(f"句子对将保存到: {sentences_output_file}")
         print(f"\n{'='*80}")
         print(f"Attacking Layer {layer}")
         print(f"{'='*80}\n")
@@ -604,17 +610,31 @@ def main():
             'success_rate': success_rate
         }
         
+        # 为每个层创建单独的结果结构
+        layer_result_data = {
+            'model_name': args.model,
+            'perm_type': args.perm_type,
+            'num_samples': len(test_samples),
+            'layer': layer,
+            'matching_eps': matching_eps,
+            'next_token_proposal': not args.no_next_token_proposal,
+            'samples': layer_results['samples'],
+            'statistics': layer_results['statistics']
+        }
+        
+        # 保存该层的结果到单独文件
+        with open(layer_output_file, 'w', encoding='utf-8') as f:
+            json.dump(layer_result_data, f, indent=2, ensure_ascii=False)
+        
         results['layers'].append(layer_results)
         
         print(f"\n{'='*80}")
         print(f"Layer {layer} 完成!")
         print(f"  Success Rate: {successful}/{total} ({success_rate:.2%})")
+        print(f"  ✅ 结果已保存到: {layer_output_file}")
         print(f"{'='*80}\n")
     
-    # 保存结果
-    with open(args.output, 'w') as f:
-        json.dump(results, f, indent=2)
-    
+    # 打印所有层的总结
     print(f"\n{'='*80}")
     print(f"🎉 攻击完成! 最终结果")
     print(f"{'='*80}")
@@ -623,7 +643,6 @@ def main():
         stats = layer_result['statistics']
         print(f"Layer {layer}: {stats['successful']}/{stats['total_samples']} ({stats['success_rate']:.2%})")
     
-    print(f"\n✅ 结果已保存到: {args.output}")
     print(f"{'='*80}\n")
 
 if __name__ == "__main__":
