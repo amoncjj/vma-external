@@ -25,10 +25,24 @@ def set_seed(seed=RANDOM_SEED):
 # Model configurations
 MODEL_CONFIGS = {
     "llama3.2-1B": "/home/junjie_chen/models/llama3.2-1B",
+    "llama3.2-3B": "/home/junjie_chen/models/llama3.2-3B",
     "llama3-8B": "/home/junjie_chen/models/llama3-8B",
     # "llama-7B": "/home/junjie_chen/models/llama-7B",  # 暂时移除：torch版本兼容性问题
     "qwen3-8B": "/home/junjie_chen/models/qwen3-8B",
+    "chatglm3-6B": "/home/junjie_chen/models/chatglm3-6B",
 }
+
+def load_tokenizer_and_model(model_name: str, model_path: str, device_map: str, model_dtype):
+    """加载tokenizer和model（兼容部分模型需要 trust_remote_code 的情况）"""
+    needs_trust_remote_code = (model_name.startswith("chatglm"))
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=needs_trust_remote_code)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=model_dtype,
+        attn_implementation="eager",
+        trust_remote_code=needs_trust_remote_code,
+    ).to(device_map)
+    return tokenizer, model
 
 def gen_kv_states(model, tokenizer, sentence, layers=[1], device_map="cuda"):
     """
@@ -412,10 +426,7 @@ def main():
     print(f"Model path: {model_path}")
     print(f"{'='*80}\n")
     
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=model_dtype, attn_implementation="eager"
-    ).to(device_map)
+    tokenizer, model = load_tokenizer_and_model(args.model, model_path, device_map, model_dtype)
     model.eval()
     
     num_hidden_layers = model.config.num_hidden_layers

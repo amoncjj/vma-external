@@ -8,9 +8,8 @@ echo "KV Cache 攻击 - 配置测试"
 echo "=================================="
 echo ""
 echo "将测试以下模型:"
-echo "  - llama3.2-1B"
-echo "  - llama3-8B"
-echo "  - qwen3-8B"
+echo "  - llama3.2-3B"
+echo "  - chatglm3-6B"
 echo ""
 echo "注意: llama-7B已移除（torch版本兼容性问题）"
 echo ""
@@ -31,7 +30,7 @@ echo ""
 echo "第一步：测试无置换场景 (perm_type=None)"
 echo "=================================="
 python test_matching_eps_kv.py \
-    --models llama3.2-1B llama3-8B qwen3-8B \
+    --models llama3.2-3B chatglm3-6B \
     --num_samples 100 \
     --max_tokens 50 \
     --perm_type None \
@@ -45,7 +44,7 @@ echo ""
 echo "第二步：测试维度置换场景 (perm_type=D)"
 echo "=================================="
 python test_matching_eps_kv.py \
-    --models llama3.2-1B llama3-8B qwen3-8B \
+    --models llama3.2-3B chatglm3-6B \
     --num_samples 100 \
     --max_tokens 50 \
     --perm_type D \

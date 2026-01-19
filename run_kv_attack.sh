@@ -3,8 +3,8 @@
 # KV Cache 攻击脚本 - 批量测试所有组合
 # 测试所有模型、所有置换类型、所有层
 
-# 模型列表
-MODELS=("llama3.2-1B" "llama3-8B" "qwen3-8B")
+# 模型列表（只跑未测的两个）
+MODELS=("llama3.2-3B" "chatglm3-6B")
 
 # 置换类型列表
 PERM_TYPES=("None" "D")
@@ -66,7 +66,7 @@ if [ $# -ge 2 ]; then
     echo ""
 
     # 运行攻击
-    python vocab_matching_attack_kv.py \
+    python3 vocab_matching_attack_kv.py \
         --model $MODEL \
         --perm_type $PERM_TYPE \
         --config $CONFIG_FILE \
@@ -170,7 +170,7 @@ for PERM_TYPE in "${PERM_TYPES[@]}"; do
             echo ""
             
             # 运行攻击（只测试这一层）
-            python vocab_matching_attack_kv.py \
+            python3 vocab_matching_attack_kv.py \
                 --model "$MODEL" \
                 --perm_type "$PERM_TYPE" \
                 --config "$CONFIG_FILE" \
